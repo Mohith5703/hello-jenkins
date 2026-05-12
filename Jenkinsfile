@@ -20,7 +20,8 @@ pipeline {
         }
 
         stage('Install & Test') {
-            steps { sh 'npm ci && npm test' }
+            // steps { sh 'npm ci && npm test' }
+            steps { sh 'npm install && npm test' }
             post {
                 always { junit 'test-results/junit.xml' }
             }
