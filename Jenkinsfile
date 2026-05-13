@@ -7,8 +7,11 @@ pipeline {
 
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
-        IMAGE_NAME = "mohi5703/hello-jenkins"   // Replace 'yourname' with your Docker Hub username
-        IMAGE_TAG  = "${BUILD_NUMBER}"
+        IMAGE_NAME      = "mohi5703/hello-jenkins"   // Replace with your Docker Hub username
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        DEPLOYMENT_NAME = "hello-jenkins"
+        CONTAINER_NAME  = "hello-jenkins"
+        K8S_NAMESPACE   = "default"
         JEST_JUNIT_OUTPUT_DIR  = 'test-results'
         JEST_JUNIT_OUTPUT_NAME = 'junit.xml'
     }
@@ -16,12 +19,14 @@ pipeline {
     stages {
 
         stage('Checkout') {
-            steps { checkout scm }
+            steps {
+                checkout scm
+                echo "Building ${GIT_BRANCH} @ ${GIT_COMMIT[0..7]}"
+            }
         }
 
         stage('Install & Test') {
-            // steps { sh 'npm ci && npm test' }
-            steps { sh 'npm install && npm test' }
+            steps { sh 'npm ci && npm test' }
             post {
                 always { junit 'test-results/junit.xml' }
             }
@@ -30,7 +35,6 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
-                // Also tag as 'latest' so it's easy to pull without knowing the build number
                 sh "docker tag  ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
             }
         }
@@ -46,27 +50,51 @@ pipeline {
             }
         }
 
-        stage('Smoke Test') {
+        stage('Deploy to Kubernetes') {
+            // 'when' condition: this stage only runs when the branch is 'main'.
+            // Feature branches build and test but never deploy to production.
+            // Only code that has been reviewed and merged to main reaches the cluster.
+            when { branch 'main' }
             steps {
-                sh "docker rm -f smoke-test || true"
-                sh "docker run -d --name smoke-test -p 3002:3000 ${IMAGE_NAME}:${IMAGE_TAG}"
-                sh "sleep 5 && curl -f http://localhost:3002/ || (docker logs smoke-test && exit 1)"
-                sh "docker rm -f smoke-test"
+                sh """
+                    kubectl set image deployment/${DEPLOYMENT_NAME} \
+                        ${CONTAINER_NAME}=${IMAGE_NAME}:${IMAGE_TAG} \
+                        -n ${K8S_NAMESPACE}
+
+                    kubectl rollout status deployment/${DEPLOYMENT_NAME} \
+                        -n ${K8S_NAMESPACE} \
+                        --timeout=120s
+                """
+            }
+        }
+
+        stage('Verify') {
+            when { branch 'main' }
+            steps {
+                sh "kubectl get pods -n ${K8S_NAMESPACE} -l app=${DEPLOYMENT_NAME}"
+                sh "kubectl get svc hello-jenkins-svc -n ${K8S_NAMESPACE}"
             }
         }
 
         stage('Cleanup') {
-            steps {
-                // Remove the local image from the Jenkins machine to save disk space.
-                // The image is safely stored on Docker Hub — removing it locally is fine.
-                sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
-            }
+            steps { sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true" }
         }
 
     }
 
     post {
-        success { echo "Image ${IMAGE_NAME}:${IMAGE_TAG} pushed." }
-        failure { echo "Pipeline failed at build ${BUILD_NUMBER}." }
+        success {
+            echo "Build ${BUILD_NUMBER}: image :${IMAGE_TAG} deployed to Kubernetes."
+        }
+        failure {
+            // If anything in the pipeline fails, automatically roll Kubernetes
+            // back to the previous working version. The '|| true' prevents
+            // the rollback command itself from causing a secondary failure.
+            sh """
+                echo 'Pipeline failed — rolling back Kubernetes deployment'
+                kubectl rollout undo deployment/${DEPLOYMENT_NAME} \
+                    -n ${K8S_NAMESPACE} || true
+            """
+        }
     }
 }
